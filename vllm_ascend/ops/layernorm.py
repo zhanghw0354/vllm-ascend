@@ -15,10 +15,14 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Any
 
 import torch
+import torch_npu
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.distributed import get_tp_group
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+from vllm_ascend import envs
 
 
 class AddRMSNormW8A8Quant(RMSNorm):
@@ -41,8 +45,6 @@ class AddRMSNormW8A8Quant(RMSNorm):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        import torch_npu
-
         if residual is not None:
             x, _, residual = torch_npu.npu_add_rms_norm_quant(
                 x,
@@ -57,14 +59,64 @@ class AddRMSNormW8A8Quant(RMSNorm):
                                              self.variance_epsilon)
         return x
 
+class RMSNormFlashCommV1(RMSNorm):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        var_hidden_size: Optional[int] = None,
+        module_name: Optional[str] = "",
+    ) -> None:
+        assert envs.VLLM_ASCEND_ENABLE_FLASHCOMM == 1, \
+            f"VLLM_ASCEND_ENABLE_FLASHCOMM must be 1, but got {envs.VLLM_ASCEND_ENABLE_FLASHCOMM}."
+        super().__init__(hidden_size, eps, var_hidden_size)
+        self.module_name = module_name
+        self.tp_size = get_tensor_model_parallel_world_size() # get tp size for each module
+        self.tp_rank = get_tensor_model_parallel_rank() # get tp rank for each module
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            residual: Optional[torch.Tensor] = None,
+            y_transform: str = "",
+    ) -> Union[tuple[dict[str, Any], Any], Any]:
+        if residual is not None:
+            x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
+            if y_transform == "AG":
+                x = get_tp_group().all_gather(x, dim=0)
+            return x, residual
+        else:
+            return torch_npu.npu_rms_norm(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )[0]
+
+    def forward_with_residual(
+            self,
+            x: torch.Tensor,
+            residual: Optional[torch.Tensor] = None,
+            y_transform: str = "",
+    ) -> Union[tuple[dict[str, Any], Any], Any]:
+        if residual is not None:
+            x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
+            if y_transform == "AG":
+                x = get_tp_group().all_gather(x, dim=0)
+            return x, residual
+        else:
+            residual = x
+            x = torch_npu.npu_rms_norm(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )[0]
+            return x, residual
 
 def forward_oot(
     self,
     x: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    import torch_npu
-
     if residual is not None:
         x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight,
                                                     self.variance_epsilon)

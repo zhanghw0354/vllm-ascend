@@ -24,6 +24,7 @@ from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -41,6 +42,8 @@ from vllm.sequence import IntermediateTensors
 from vllm_ascend.ops.fused_moe import AscendSparseMoeBlock
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
+from vllm_ascend.ops.layernorm import RMSNormFlashCommV1
+from vllm_ascend import envs
 
 
 class AscendQwen3MoeDecoderLayer(nn.Module):
@@ -174,11 +177,24 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
                 prefix=prefix),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.enable_fc = envs.VLLM_ASCEND_ENABLE_FLASHCOMM
+        if self.enable_fc == 1:
+            self.norm = RMSNormFlashCommV1(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
 
+    def get_tp_slice(self, x: torch.Tensor):
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        assert x.shape[0] % tp_size == 0, f"x can't be divided along tp_size {tp_size}!"
+        slice_size = x.shape[0] // tp_size
+        x_slice = x[tp_rank * slice_size: (tp_rank + 1) * slice_size]
+
+        return x_slice
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -197,6 +213,8 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        if self.enable_fc == 1:
+            hidden_states = self.get_tp_slice(hidden_states)
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
