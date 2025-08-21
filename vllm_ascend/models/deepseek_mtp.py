@@ -24,18 +24,21 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import get_sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.layers.vocab_parallel_embedding import \
+    VocabParallelEmbedding
 from vllm.model_executor.models.deepseek_mtp import (
     DeepSeekMTP, DeepSeekMultiTokenPredictor, DeepSeekMultiTokenPredictorLayer,
     SharedHead)
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+
+from vllm_ascend.ops.lmhead import CustomParallelLMHead
+from vllm_ascend.ops.logits_processor import CustomLogitsProcessor
 
 from .deepseek_v2 import CustomDeepseekV2DecoderLayer
 
@@ -48,10 +51,10 @@ class CustomDeepSeekShareHead(SharedHead):
                  prefix: str = "") -> None:
         nn.Module.__init__(self)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.head = ParallelLMHead(config.vocab_size,
-                                   config.hidden_size,
-                                   quant_config=quant_config,
-                                   prefix=maybe_prefix(prefix, "head"))
+        self.head = CustomParallelLMHead(config.vocab_size,
+                                         config.hidden_size,
+                                         quant_config=quant_config,
+                                         prefix=maybe_prefix(prefix, "head"))
 
 
 class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
@@ -98,9 +101,11 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
             inputs_embeds = self.embed_tokens(input_ids)
         assert inputs_embeds is not None
         # masking inputs at position 0, as not needed by MTP
-        inputs_embeds = torch.where((positions == 0).unsqueeze(-1),
-                                    torch.zeros_like(inputs_embeds),
-                                    inputs_embeds)
+        forward_context = get_forward_context()
+        if forward_context.with_prefill:
+            inputs_embeds = torch.where((positions == 0).unsqueeze(-1),
+                                        torch.zeros_like(inputs_embeds),
+                                        inputs_embeds)
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -142,7 +147,7 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
             for idx in range(self.mtp_start_layer_idx,
                              self.mtp_start_layer_idx + self.num_mtp_layers)
         ]
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = CustomLogitsProcessor(config.vocab_size)
 
     def forward(
         self,

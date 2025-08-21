@@ -96,7 +96,9 @@ def model_input_split_v1_mla_attn(
      ] = split_attn_int_type(attn_metadata.num_prefills,
                              max(0, seq_index - attn_metadata.num_decodes))
     seq_lens = attn_metadata.prefill.seq_lens if attn_metadata.num_prefills > 0 else attn_metadata.decode.seq_lens
-    [seq_lens_pre, seq_lens_post] = split_attn_tensor_type(seq_lens, seq_index)
+    [seq_lens_pre, seq_lens_post
+     ] = split_attn_tensor_type(seq_lens,
+                                max(0, seq_index - attn_metadata.num_decodes))
 
     query_start_loc_pre = query_start_loc_post = None
     if attn_metadata.query_start_loc is not None:
@@ -120,17 +122,14 @@ def model_input_split_v1_mla_attn(
         # chunked prefill
         if num_prefills_pre > 0:
             attn_state_pre = attn_state_post = AscendAttentionState.ChunkedPrefill
-            attn_mask_pre = attn_metadata.attn_mask[:token_index, :max(
-                seq_lens_pre)].contiguous()
+            attn_mask_pre = None
             attn_state_post = AscendAttentionState.ChunkedPrefill
-            attn_mask_post = attn_metadata.attn_mask[
-                token_index:, :max(seq_lens_post)].contiguous()
+            attn_mask_post = None
         else:
             attn_state_pre = AscendAttentionState.DecodeOnly
             attn_mask_pre = None
             attn_state_post = AscendAttentionState.ChunkedPrefill
-            attn_mask_post = attn_metadata.attn_mask[
-                token_index:, :max(seq_lens_post)].contiguous()
+            attn_mask_post = None
     from vllm_ascend.attention.mla_v1 import (AscendMLADecodeMetadata,
                                               AscendMLAPrefillMetadata)
     if num_prefills_pre > 0:
@@ -156,12 +155,18 @@ def model_input_split_v1_mla_attn(
                                                   attn_metadata.num_decodes:]
         ) - attn_metadata.prefill.query_start_loc[seq_index -
                                                   attn_metadata.num_decodes]
-        context_len_pre = seq_lens_pre[attn_metadata.num_decodes:]
+        context_len_pre = seq_lens_pre
         context_len_post = seq_lens_post
         prefill_max_query_len_pre = max(prefill_query_lens_pre)
         prefill_max_query_len_post = max(prefill_query_lens_post)
+        [cos_pre, cos_post] = split_attn_tensor_type(
+            attn_metadata.prefill.cos,
+            token_index - attn_metadata.num_decode_tokens)
+        [sin_pre, sin_post] = split_attn_tensor_type(
+            attn_metadata.prefill.sin,
+            token_index - attn_metadata.num_decode_tokens)
         prefill_pre = AscendMLAPrefillMetadata(
-            attn_mask=attn_mask_pre,
+            attn_mask=attn_metadata.prefill.attn_mask,
             query_lens=prefill_query_lens_pre,
             seq_lens=seq_lens_pre,
             query_start_loc=prefill_query_start_loc_pre,
@@ -170,9 +175,10 @@ def model_input_split_v1_mla_attn(
             block_table=block_tables_pre,
             max_query_len=prefill_max_query_len_pre,
             max_seq_lens=context_len_pre.max().item(),
-        )
+            cos=cos_pre,
+            sin=sin_pre)
         prefill_post = AscendMLAPrefillMetadata(
-            attn_mask=attn_mask_post,
+            attn_mask=attn_metadata.prefill.attn_mask,
             query_lens=prefill_query_lens_post,
             seq_lens=seq_lens_post,
             query_start_loc=prefill_query_start_loc_post,
@@ -181,7 +187,8 @@ def model_input_split_v1_mla_attn(
             block_table=block_tables_post,
             max_query_len=prefill_max_query_len_post,
             max_seq_lens=context_len_post.max().item(),
-        )
+            cos=cos_post,
+            sin=sin_post)
         decode_pre = attn_metadata.decode
         decode_post = None
     else:
