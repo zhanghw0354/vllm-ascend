@@ -78,12 +78,10 @@ class RMSNormFlashCommV1(RMSNorm):
             self,
             x: torch.Tensor,
             residual: Optional[torch.Tensor] = None,
-            y_transform: str = "",
     ) -> Union[tuple[dict[str, Any], Any], Any]:
         if residual is not None:
             x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
-            if y_transform == "AG":
-                x = get_tp_group().all_gather(x, dim=0)
+            x = get_tp_group().all_gather(x, dim=0)
             return x, residual
         else:
             return torch_npu.npu_rms_norm(
