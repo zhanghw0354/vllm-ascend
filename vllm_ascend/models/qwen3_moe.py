@@ -190,7 +190,7 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
 
-        assert x.shape[0] % tp_size == 0, f"x can't be divided along tp_size {tp_size}!"
+        assert x.shape[0] % tp_size == 0, f"x {x.shape[0]} can't be divided along tp_size {tp_size}!"
         slice_size = x.shape[0] // tp_size
         x_slice = x[tp_rank * slice_size: (tp_rank + 1) * slice_size]
 
