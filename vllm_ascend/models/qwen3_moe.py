@@ -185,16 +185,6 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
-
-    def get_tp_slice(self, x: torch.Tensor):
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-
-        assert x.shape[0] % tp_size == 0, f"x {x.shape[0]} can't be divided along tp_size {tp_size}!"
-        slice_size = x.shape[0] // tp_size
-        x_slice = x[tp_rank * slice_size: (tp_rank + 1) * slice_size]
-
-        return x_slice
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -214,7 +204,15 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         if self.enable_fc == 1:
-            hidden_states = self.get_tp_slice(hidden_states)
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            pad_size = 0
+            if hidden_states.shape[0] % tp_size != 0:
+                pad_size = tp_size - (hidden_states.shape[0] % tp_size)
+                hidden_states = torch.nn.functional.pad(
+                    hidden_states, (0, 0, 0, pad_size), value=0)
+            slice_size = hidden_states.shape[0] // tp_size
+            hidden_states = hidden_states[tp_rank * slice_size: (tp_rank + 1) * slice_size]
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -233,6 +231,8 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
         if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
             hidden_states = _metadata_for_padding.allgather_unpadding_aligned(
                 hidden_states)
+        if self.enable_fc == 1 and pad_size > 0:
+            hidden_states = hidden_states[:-pad_size]
 
         return hidden_states
 
