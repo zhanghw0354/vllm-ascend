@@ -16,11 +16,12 @@
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
 
-from typing import Optional, Union
+from typing import Optional, Union, Any
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
@@ -28,11 +29,13 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.layers.linear import (QKVParallelLinear,
+                                               RowParallelLinear)
 from vllm.model_executor.models.interfaces import SupportsPP
-from vllm.model_executor.models.qwen3_moe import (Qwen3MoeAttention,
-                                                  Qwen3MoeForCausalLM,
+from vllm.model_executor.models.qwen3_moe import (Qwen3MoeForCausalLM,
                                                   Qwen3MoeMLP, Qwen3MoeModel)
 from vllm.model_executor.models.utils import (
     extract_layer_index, make_empty_intermediate_tensors_factory, make_layers,
@@ -42,9 +45,148 @@ from vllm.sequence import IntermediateTensors
 from vllm_ascend.ops.fused_moe import AscendSparseMoeBlock
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
-from vllm_ascend.ops.layernorm import RMSNormFlashCommV1
+from vllm_ascend.ops.layernorm import RMSNormFlashComm
 from vllm_ascend import envs
+from vllm_ascend.layers.linear import (QKVParallelFlashCommLinear,
+                                       RowParallelFlashCommLinear)
 
+class CustomQwen3MoeAttention(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        head_dim: Optional[int] = None,
+        rms_norm_eps: float = 1e-06,
+        qkv_bias: bool = False,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size() 
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = head_dim or (hidden_size // self.total_num_heads)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+        tp_rank = get_tensor_model_parallel_rank() 
+        self.enable_fc = envs.VLLM_ASCEND_ENABLE_FLASHCOMM
+
+        if self.enable_fc == 1:
+            self.qkv_proj = QKVParallelFlashCommLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj"
+            )
+            self.o_proj = RowParallelFlashCommLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj"
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj")
+            self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj")
+
+        #if rope_scaling is None:
+        #    rope_scaling = {'factor': '0'}
+        #rope_scaling["rope_type"] = 'qwen'
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+        )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn")
+        
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        #kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        #attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        if self.enable_fc == 1:
+            qkv, _ = self.qkv_proj(hidden_states, x_transform='AG')
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
+                           self.head_dim)
+        q_by_head = self.q_norm(q_by_head)
+        q = q_by_head.view(q.shape)
+
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
+                            self.head_dim)
+        k_by_head = self.k_norm(k_by_head)
+        k = k_by_head.view(k.shape)
+
+        #if attn_metadata is None:
+        #    cos, sin = self.rotary_emb.get_cos_sin(positions)
+        #else:
+        #    cos = attn_metadata.cos
+        #    sin = attn_metadata.sin
+
+        #q, k = self.rotary_emb(positions, q, k, cos, sin)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        if self.enable_fc == 1:
+            output, _ = self.o_proj(attn_output, reduce_type="RS")
+        else:
+            output, _ = self.o_proj(attn_output)
+
+        return output
 
 class AscendQwen3MoeDecoderLayer(nn.Module):
 
@@ -62,7 +204,7 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        self.self_attn = Qwen3MoeAttention(
+        self.self_attn = CustomQwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -179,7 +321,7 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
         )
         self.enable_fc = envs.VLLM_ASCEND_ENABLE_FLASHCOMM
         if self.enable_fc == 1:
-            self.norm = RMSNormFlashCommV1(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNormFlashComm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (
@@ -226,7 +368,10 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
                 "residual": residual
             })
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if self.enable_fc == 1:
+            hidden_states, _ = self.norm(hidden_states, residual, y_transform='AG')
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
             hidden_states = _metadata_for_padding.allgather_unpadding_aligned(
