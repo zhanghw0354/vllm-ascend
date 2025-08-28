@@ -36,6 +36,7 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_moe import (Qwen3MoeForCausalLM,
+                                                  Qwen3MoeAttention,
                                                   Qwen3MoeMLP, Qwen3MoeModel)
 from vllm.model_executor.models.utils import (
     extract_layer_index, make_empty_intermediate_tensors_factory, make_layers,
@@ -204,7 +205,7 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        self.self_attn = CustomQwen3MoeAttention(
+        self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
